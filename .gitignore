@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*-images/
+*.md.tmp
+.DS_Store
