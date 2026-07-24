@@ -97,11 +97,24 @@ def extract_content(html, url):
         katex_html = katex.select_one('.katex-html')
         if katex_html:
             formula = katex_html.get_text(strip=True).replace('​', '')
-            katex.replace_with(formula)   # plain string — no tag wrapping
+            # Wrap in backticks so formulas stand out from body text.
+            # Simple formulas (e.g. "q1") are readable inline.
+            # Complex formulas (matrices, piecewise) will need manual LaTeX fix
+            # but at least they're marked as formulas and kept on one line.
+            katex.replace_with(f'`{formula}`')
 
-    # ── Step 1b: preserve font colors & strong/em as inline HTML ──────
-    # Markdown Preview Enhanced renders inline HTML; standard GFM ignores
-    # but text remains readable.
+    # ── Step 1b: preserve links, font colors & strong/em ───────────────
+    # Convert <a> to markdown links before extraction (get_text strips tags).
+    for tag in soup.find_all('a'):
+        href = tag.get('href', '')
+        text = tag.get_text(strip=True)
+        if not text:
+            tag.decompose()
+        elif href and not href.startswith('#'):
+            tag.replace_with(f'[{text}]({href})')
+        else:
+            tag.unwrap()  # remove the <a> but keep the text
+
     for tag in soup.find_all(['strong', 'b']):
         tag.replace_with(f"**{tag.get_text()}**")
     for tag in soup.find_all(['em', 'i']):
@@ -114,6 +127,12 @@ def extract_content(html, url):
         else:
             tag.unwrap()
     for tag in soup.find_all('center'):
+        # Images inside <center> need to survive — convert them to markdown first
+        for img in tag.find_all('img'):
+            src = img.get('src') or img.get('data-src') or ''
+            alt = img.get('alt', '') or ''
+            if src and not src.startswith('data:'):
+                img.replace_with(f'![{alt}]({src})')
         text = tag.get_text(strip=True)
         tag.replace_with(f'\n<center>{text}</center>\n')
 
@@ -185,15 +204,51 @@ def extract_content(html, url):
 
         # ── Paragraph ───────────────────────────────────────────────
         elif tag == 'p':
-            # Extract inline images first
-            for img in el.find_all('img'):
-                img_data = extract_img(img)
-                if img_data and img_data['src'] not in seen_img_urls:
-                    seen_img_urls.add(img_data['src'])
-                    elements.append(img_data)
-            text = el.get_text(strip=True)
-            if text and len(text) > 2:
-                elements.append({'type': 'paragraph', 'text': text})
+            # Walk children in document order — text and images interleaved
+            from bs4 import NavigableString
+            parts = []
+            for child in el.children:
+                if isinstance(child, NavigableString):
+                    parts.append(('text', child.strip()))
+                elif hasattr(child, 'name'):
+                    if child.name == 'img':
+                        img_data = extract_img(child)
+                        if img_data and img_data['src'] not in seen_img_urls:
+                            seen_img_urls.add(img_data['src'])
+                            parts.append(('img', img_data))
+                    elif child.name == 'br':
+                        parts.append(('br', None))
+                    else:
+                        # Inline tags — extract images inside, then text
+                        for sub_img in child.find_all('img'):
+                            img_data = extract_img(sub_img)
+                            if img_data and img_data['src'] not in seen_img_urls:
+                                seen_img_urls.add(img_data['src'])
+                                parts.append(('img', img_data))
+                        t = child.get_text(strip=True)
+                        if t:
+                            parts.append(('text', t))
+
+            # Emit interleaved: group consecutive text, emit images in place
+            text_buf = []
+            for kind, data in parts:
+                if kind == 'text' and data:
+                    text_buf.append(data)
+                elif kind == 'img':
+                    if text_buf:
+                        merged = ' '.join(text_buf)
+                        if len(merged) > 2:
+                            elements.append({'type': 'paragraph', 'text': merged})
+                        text_buf = []
+                    elements.append(data)
+                elif kind == 'br':
+                    pass  # line break = text split; already handled by segment grouping
+
+            # Flush remaining text
+            if text_buf:
+                merged = ' '.join(text_buf)
+                if len(merged) > 2:
+                    elements.append({'type': 'paragraph', 'text': merged})
 
         # ── Standalone image ────────────────────────────────────────
         elif tag == 'img':
@@ -248,7 +303,8 @@ def extract_content(html, url):
 # ── Image download ─────────────────────────────────────────────────────
 
 def download_images(elements, img_dir):
-    """Download images referenced in elements, return updated elements with local paths."""
+    """Download images with retry, return updated elements with local paths."""
+    import time
     import requests
     img_dir = Path(img_dir)
     img_dir.mkdir(parents=True, exist_ok=True)
@@ -269,14 +325,25 @@ def download_images(elements, img_dir):
         filepath = img_dir / filename
 
         if not filepath.exists():
-            try:
-                headers = {'User-Agent': UA, 'Referer': 'https://blog.csdn.net/'}
-                resp = requests.get(src, headers=headers, timeout=30)
-                resp.raise_for_status()
-                filepath.write_bytes(resp.content)
-                print(f"[img {img_count:02d}] {filename} ({len(resp.content)} bytes)")
-            except Exception as e:
-                print(f"[img {img_count:02d}] FAILED: {src[:80]} — {e}")
+            success = False
+            last_error = None
+            for attempt in range(3):
+                try:
+                    headers = {'User-Agent': UA, 'Referer': 'https://blog.csdn.net/'}
+                    resp = requests.get(src, headers=headers, timeout=15)
+                    resp.raise_for_status()
+                    filepath.write_bytes(resp.content)
+                    print(f"[img {img_count:02d}] {filename} ({len(resp.content)} bytes)")
+                    success = True
+                    break
+                except Exception as e:
+                    last_error = e
+                    if attempt < 2:
+                        delay = 2 ** (attempt + 1)  # 2s, 4s
+                        print(f"[img {img_count:02d}] retry {attempt+1} in {delay}s...")
+                        time.sleep(delay)
+            if not success:
+                print(f"[img {img_count:02d}] FAILED after 3 retries: {src[:80]} — {last_error}")
                 img_count += 1
                 continue
         else:
