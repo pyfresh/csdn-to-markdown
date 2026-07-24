@@ -309,9 +309,46 @@ def extract_content(html, url):
 
         # ── Blockquote ──────────────────────────────────────────────
         elif tag == 'blockquote':
-            text = el.get_text(strip=True)
-            if text and len(text) > 2:
-                elements.append({'type': 'blockquote', 'text': text})
+            # Extract inline images before getting text (same as paragraph handler)
+            from bs4 import NavigableString
+            parts = []
+            for child in el.children:
+                if isinstance(child, NavigableString):
+                    parts.append(('text', child.strip()))
+                elif hasattr(child, 'name'):
+                    if child.name == 'img':
+                        img_data = extract_img(child)
+                        if img_data and img_data['src'] not in seen_img_urls:
+                            seen_img_urls.add(img_data['src'])
+                            parts.append(('img', img_data))
+                    elif child.name in ('br', 'p'):
+                        parts.append(('br', None))
+                        # If it's a p, extract its images and text
+                        if child.name == 'p':
+                            for sub_img in child.find_all('img'):
+                                img_data = extract_img(sub_img)
+                                if img_data and img_data['src'] not in seen_img_urls:
+                                    seen_img_urls.add(img_data['src'])
+                                    parts.append(('img', img_data))
+                            t = child.get_text(strip=True)
+                            if t:
+                                parts.append(('text', t))
+                    else:
+                        t = child.get_text(strip=True)
+                        if t:
+                            parts.append(('text', t))
+            # Emit interleaved
+            text_buf = []
+            for kind, data in parts:
+                if kind == 'text' and data:
+                    text_buf.append(data)
+                elif kind == 'img':
+                    if text_buf:
+                        elements.append({'type': 'blockquote', 'text': ' '.join(text_buf)})
+                        text_buf = []
+                    elements.append(data)
+            if text_buf:
+                elements.append({'type': 'blockquote', 'text': ' '.join(text_buf)})
 
     img_count = sum(1 for e in elements if e['type'] == 'image')
     print(f"[extract] title='{title[:40]}...', {len(elements)} elements, {img_count} images")
