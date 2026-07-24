@@ -119,7 +119,7 @@ def extract_content(html, url):
             if _is_display(latex):
                 katex.replace_with(f'\n$$\n{latex}\n$$\n')
             else:
-                katex.replace_with(f'`{latex}`')
+                katex.replace_with(f'${latex}$')
 
     # ── Step 1b: preserve links, font colors & strong/em ───────────────
     # Convert <a> to markdown links before extraction (get_text strips tags).
