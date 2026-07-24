@@ -93,15 +93,33 @@ def extract_content(html, url):
     soup = BeautifulSoup(html, 'html.parser')
 
     # ── Step 1: flatten KaTeX into plain inline text ───────────────────
+    # ── Step 1: extract LaTeX source from KaTeX MathML ───────────────
+    # CSDN's KaTeX puts the original LaTeX as the last line inside
+    # .katex-mathml. Simple formulas (t, [0,1]) → inline backtick.
+    # Complex formulas (\begin{array}, \frac, \begin{cases}) → $$ block.
+    def _extract_latex(katex_el):
+        ml = katex_el.select_one('.katex-mathml')
+        if not ml:
+            return None
+        lines = [l.strip() for l in ml.get_text().split('\n') if l.strip()]
+        if not lines:
+            return None
+        for line in reversed(lines):
+            if '\\' in line:
+                return line
+        return lines[-1]
+
+    def _is_display(latex):
+        triggers = ['\\begin{', '\\frac', '\\sum', '\\prod', '\\int', '\\\\']
+        return any(t in latex for t in triggers)
+
     for katex in soup.select('.katex'):
-        katex_html = katex.select_one('.katex-html')
-        if katex_html:
-            formula = katex_html.get_text(strip=True).replace('​', '')
-            # Wrap in backticks so formulas stand out from body text.
-            # Simple formulas (e.g. "q1") are readable inline.
-            # Complex formulas (matrices, piecewise) will need manual LaTeX fix
-            # but at least they're marked as formulas and kept on one line.
-            katex.replace_with(f'`{formula}`')
+        latex = _extract_latex(katex)
+        if latex:
+            if _is_display(latex):
+                katex.replace_with(f'\n$$\n{latex}\n$$\n')
+            else:
+                katex.replace_with(f'`{latex}`')
 
     # ── Step 1b: preserve links, font colors & strong/em ───────────────
     # Convert <a> to markdown links before extraction (get_text strips tags).
